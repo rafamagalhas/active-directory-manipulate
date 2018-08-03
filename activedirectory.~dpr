@@ -1,0 +1,315 @@
+library activedirectory;
+
+{ Important note about DLL memory management: ShareMem must be the
+  first unit in your library's USES clause AND your project's (select
+  Project-View Source) USES clause if your DLL exports any procedures or
+  functions that pass strings as parameters or function results. This
+  applies to all strings passed to and from your DLL--even those that
+  are nested in records and classes. ShareMem is the interface unit to
+  the BORLNDMM.DLL shared memory manager, which must be deployed along
+  with your DLL. To avoid using BORLNDMM.DLL, pass string information
+  using PChar or ShortString parameters. }
+
+uses
+  Windows,
+  SysUtils,
+  Classes,
+  ActiveX,
+  ComObj,
+  Registry,
+  ActiveDs_TLB in '..\..\..\..\Program Files (x86)\Borland\Delphi7\Imports\ActiveDs_TLB.pas',
+  adshlp in '..\..\..\..\Program Files (x86)\Borland\Delphi7\Imports\adshlp.pas';
+
+{$R *.res}
+
+// bind do active directory
+function Getobject(const name: string): idispatch;stdcall;
+var
+  moniker:Imoniker;
+  Eaten:integer;
+  Bindcontext:Ibindctx;
+  dispatch:IDispatch;
+begin
+  OleCheck(CreateBindCtx(0,Bindcontext));
+  OleCheck(MkParseDisplayName(BindContext,PWideChar(WideString(Name)),Eaten,Moniker));
+  OleCheck(Moniker.BindToObject(BindContext,nil,Idispatch,Dispatch));
+  Result := Dispatch;
+end;
+
+// obter o dominio da maquina
+function GetDomainname: string;stdcall;
+type
+  P_WKSTA_INFO_100 = ^T_WKSTA_INFO_100;
+  _WKSTA_INFO_100 = record
+    wki100_platform_id: LongInt;
+    wki100_computername: PWideChar;
+    wki100_langroup: PWideChar;
+    wki100_ver_major: LongInt;
+    wki100_ver_minor: LongInt;
+  end;
+  T_WKSTA_INFO_100 = _WKSTA_INFO_100;
+var
+  DLLHandle: THandle;
+  Info: P_WKSTA_INFO_100;
+  NetWkstaGetInfo: function(servername: PAnsiChar; Level: DWord; var Buf:
+    P_WKSTA_INFO_100): DWORD; Stdcall;
+begin
+  Result := '';
+  DLLHandle := LoadLibrary('NETAPI32.DLL');
+  if DLLHandle = 0 then //Can't load DLL
+    exit;
+  @NetWkstaGetInfo := GetProcAddress(DLLHandle, 'NetWkstaGetInfo');
+  if @NetWkstaGetInfo = nil then //Exported function not found
+  begin
+    FreeLibrary(DLLHandle);
+    exit;
+  end;
+  if NetWkstaGetInfo(nil, 100, Info) = 0 then
+    Result := Info^.wki100_langroup;
+  FreeLibrary(DLLHandle);
+end;
+
+// pegar o nome do dominio, LDAP
+function ldapDomainName(domainname: String): String;stdcall;
+var
+  ad: IADs;
+  hr: HRESULT;
+  domain: String;
+begin
+  if(domainname <> GetDomainname) then
+    domain := GetDomainname
+  else
+    domain := domainname;
+
+
+  hr := ADsGetObject('LDAP://'+domain, IADs, ad);
+  if(Failed(hr)) then
+  begin
+    Result := '';
+    Exit;
+  end;
+
+  domain := ad.Get('distinguishedName');
+  Result := domain;
+end;
+
+
+// pegar o nome do dominio, WinNT
+function winNTDomainName(domainname: String): String;stdcall;
+var
+  domain: String;
+begin
+  if(domainname <> GetDomainname) then
+    domain := GetDomainname
+  else
+    domain := domainname;
+
+  Result := domain;
+end;
+
+// Autenticar os usuarios utilizando o AD
+function UserAuthentication(domainname, username, password: String): Integer;stdcall;
+var
+  Obj:IADs;
+begin
+  try
+    CoInitialize(nil);
+    ADsOpenObject('LDAP://'+ldapDomainName(domainname),LowerCase(username),password,ADS_SECURE_AUTHENTICATION,IADs,Obj);
+    Result := 0;
+  except
+    Result := 1;
+  end;
+    CoUninitialize;
+end;
+
+//Criar grupos no dominio
+function GroupCreate(domainname, groupname: String): Integer;stdcall;
+var
+  group:IADsGroup;
+  cont:IADsContainer;
+begin
+  try
+    CoInitialize(nil);
+
+    cont := GetObject('WinNT://'+winNTDomainName(domainname)) as IADsContainer;
+    group := cont.Create('Group', groupname) as IADsGroup;
+    group.SetInfo;
+
+    Result := 0;
+
+    cont._Release;
+    group._Release;
+    CoUninitialize;
+  except
+    Result := 1;
+  end;
+end;
+
+// Usuário deve alterar a senha no próximo logon
+function UserMustChangePass(domainname, username: String): Integer;stdcall;
+var
+  user : IADsUser;
+  pwd : OleVariant;
+begin
+  try
+    pwd := 0;
+    AdsGetObject('LDAP://cn='+username+',cn=Users,'+ldapDomainName(domainname), IADsUser, user); // bind to the object
+    user.Put( 'pwdLastSet', pwd); // set properties
+    user.SetInfo;
+
+    Result := 0;
+  except
+    Result := 1;
+  end;
+end;
+
+// A senha nunca expira
+function PasswordNeverExpire(domainname, username: String): Integer;stdcall;
+var
+  user: IADsUser;
+begin
+  try
+    user := GetObject('WinNT://'+winNTDomainName(domainname)+'/'+username) as IADsUser;
+
+    user.Put('UserFlags', user.Get('UserFlags') OR 65536);
+    user.SetInfo;
+
+    Result := 0;
+  except
+    Result := 1;
+  end;
+end;
+
+
+//Criar usuários no dominio e adicionar ao grupo
+function UserCreate(domainname, groupname, username, password: String): Integer;stdcall;
+var
+  container : IADsContainer;
+  user : IADsUser;
+  group:IADsGroup;
+begin
+  try
+    CoInitialize(nil);
+    domainname := winNTDomainName(domainname);
+    container  := GetObject('WinNT://'+domainname) as IADsContainer;
+
+    // Criando o user e setando o password
+    user := container.Create('User', username) as IADsUser;
+    user.SetPassword(password);
+    user.SetInfo;
+
+    //Se o nome do grupo for passado, adiciono o usuario ao grupo
+    if (groupname <> '') then
+    begin
+      group := GetObject('WinNT://'+domainname+'/'+groupname) as IADsGroup;
+      group.Add('WinNT://'+domainname+'/'+username);
+    end;
+
+    Result := 0;
+
+    container._Release;
+    user._Release;
+    CoUninitialize;
+  except
+    Result := 1;
+  end;
+end;
+
+// Alterar senha do usuário
+function UserChangePassword(domainname, username, oldpassword, password: String):Integer;stdcall;
+var
+  user : IADsUser;
+begin
+  try
+    CoInitialize(nil);
+    user := GetObject('WinNT://'+winNTDomainName(domainname)+'/'+username) as IADsUser;
+    user.SetPassword(password);
+    user.SetInfo;
+
+    Result := 0;
+
+    user._Release;
+    CoUninitialize;
+  except
+    Result := 1;
+  end;
+
+end;
+
+// Remover usuario do dominio
+function UserGroupRemove(domainname, username, groupname: String): Integer;stdcall;
+var
+  user:IADsUser;
+  group:IADsGroup;
+  cont:IADsContainer;
+begin
+  try
+    CoInitialize(nil);
+    //validar o nome do dominio
+    domainname := winNTDomainName(domainname);
+
+    group := GetObject('WinNT://'+domainname+'/'+groupname) as IADsGroup;
+    user  := GetObject('WinNT://'+domainname+'/'+username) as IADsUser;
+
+    group.Remove('WinNT://'+domainname+'/'+username);
+    Result := 0;
+    cont._Release;
+    Group._Release;
+    CoUninitialize;
+  except
+    Result := 1;
+  end;
+end;
+
+//Remover usuário
+function UserDelete(domainname, username: String): Integer;stdcall;
+var
+  cont:IADsContainer;
+begin
+  try
+    CoInitialize(nil);
+
+    cont  := GetObject('WinNT://' + winNTDomainName(domainname)) as IADsContainer; //domain bind
+    cont.Delete('User', username); //delete user from domain
+
+    Result := 0;
+    cont._Release;
+    CoUninitialize;
+  except
+    Result := 1;
+  end;
+end;
+
+//Remover um grupo
+function GroupDelete(domainname, groupname: String): Integer;stdcall;
+var
+  cont: IADsContainer;
+begin
+  try
+    CoInitialize(nil);
+
+    cont  := GetObject('WinNT://' + winNTDomainName(domainname)) as IADsContainer; //domain bind
+    cont.Delete('Group', groupname); //delete user from domain
+
+    Result := 0;
+    cont._Release;
+    CoUninitialize;
+  except
+    Result := 1;
+  end;
+end;
+
+exports
+  UserAuthentication,
+  GroupCreate,
+  UserCreate,
+  UserChangePassword,
+  UserGroupRemove,
+  UserDelete,
+  GroupDelete,
+  UserMustChangePass,
+  PasswordNeverExpire;
+
+begin
+
+end.
